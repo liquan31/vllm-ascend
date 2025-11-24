@@ -516,7 +516,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     )
 
             req_ids_to_add.append(req_id)
-
+        # print(f"lq debug, scheduler_output in update states is {scheduler_output}")
         # Update the states of the running/resumed requests.
         req_data = scheduler_output.scheduled_cached_reqs
         is_last_rank = get_pp_group().is_last_rank
@@ -1080,6 +1080,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
+        token_to_req_id = [self.input_batch.req_ids[idx] for idx in req_indices]
+        # print(
+        #     f"lq debug, req_indices is {req_indices}, token_to_req_id is {token_to_req_id}, positions_np is {positions_np}")
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1145,7 +1148,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.attn_state = attn_state  # type: ignore
 
         extra_builder_kwargs = {}
-
+        # extra_builder_kwargs['req_indices'] = req_indices
         self.query_start_loc_np[0] = 0
         self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
         self.query_start_loc[:num_reqs + 1].copy_(
@@ -1203,6 +1206,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare input_ids
+        # print(
+        #     f"lq debug, input_ids_cpu before forward is {self.input_ids_cpu}, attn_metadata.req_indices is {attn_metadata.req_indices}")
         token_indices = (positions_np +
                          req_indices * self.input_batch.token_ids_cpu.shape[1])
         torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
@@ -1264,6 +1269,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.items()
             })
 
+        attn_metadata.req_indices = token_to_req_id
+        attn_metadata.positions = positions_np.tolist()
+        from vllm_ascend.ops.fused_moe import RoutingRecorder
+        recorder = RoutingRecorder()
+        # if attn_metadata:
+        #     print(
+        #         f"lq debug, attn_metadata.positions before forward is {attn_metadata.positions}, record is {recorder.dump()}")
         # Run forward pass
         with set_ascend_forward_context(
                 attn_metadata,
@@ -1732,6 +1744,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             for i in discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
+            # print(f"lq debug, valid_sampled_token_ids is {valid_sampled_token_ids}")
             # Cache the sampled tokens in the model runner, so that the schedulerAdd commentMore actions
             # doesn't need to send them back.
             # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -1755,7 +1768,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_id = self.input_batch.req_ids[req_idx]
                 req_state = self.requests[req_id]
                 req_state.output_token_ids.extend(sampled_ids)
-
+            # print(f"lq debug, input_ids_cpu after forward is {self.input_ids_cpu}")
             spec_token_ids = self._get_spec_token_ids(
                 valid_sampled_token_ids,
                 sampling_metadata,

@@ -17,6 +17,7 @@
 
 import os
 from typing import Any, Callable, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -37,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
+from vllm.model_executor.models.utils import extract_layer_index
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -55,6 +57,84 @@ from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
                                get_rm_router_logits_state, is_310p)
 
 MOE_ALL2ALL_BUFFER: bool = envs_ascend.MOE_ALL2ALL_BUFFER
+
+
+@dataclass
+class RoutingRecord:
+    req_indices: list[str]
+    positions: list[int]
+    layer_idx: int
+    topk_ids: torch.Tensor
+
+
+class RoutingRecorder:
+    _instance = None
+    _enable = False
+    _records: list[RoutingRecord] = []
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(RoutingRecorder, cls).__new__(cls)
+        return cls._instance
+
+    def record(self, req_indices, positions, layer_idx, topk_ids):
+        if not self._enable:
+            return
+        self._records.append(RoutingRecord(
+            req_indices=req_indices,
+            positions=positions,
+            layer_idx=layer_idx,
+            topk_ids=topk_ids.cpu(),
+        ))
+
+    def clear(self):
+        self._records: list[RoutingRecord] = []
+
+    def start_record(self):
+        self._enable = True
+        self._records.clear()
+
+    def stop_record(self):
+        self._enable=False
+
+    def converge_records_to_per_rids(self):
+        if not self._enable:
+            return
+        # print(f"lq debug, routing info before converge is {self._records}")
+        result = {}
+        chunks_by_rid = {}
+        positions_by_rid = {}
+        for rec in self._records:
+            for i, rid in enumerate(rec.req_indices):
+                if rid not in chunks_by_rid:
+                    chunks_by_rid[rid] = []
+                chunks_by_rid[rid].append((rec.layer_idx, rec.topk_ids[i:i + 1, :]))
+                if rid not in positions_by_rid:
+                    positions_by_rid[rid] = []
+                positions_by_rid[rid].append(rec.positions[i])
+        for rid in positions_by_rid:
+            positions_by_rid[rid] = list(dict.fromkeys(positions_by_rid[rid]))
+        # print(f"lq debug, positions_by_rid is {positions_by_rid}")
+        for rid, chunks in chunks_by_rid.items():
+            chunks_by_layer = {}
+            for layer_idx, chunk in chunks:
+                if layer_idx not in chunks_by_layer:
+                    chunks_by_layer[layer_idx] = []
+                chunks_by_layer[layer_idx].append(chunk)
+            max_layer = max(chunks_by_layer.keys()) + 1
+            T = len(positions_by_rid[rid])
+            K = chunks[0][1].shape[1]
+
+            full_layer_topk = torch.full((max_layer, T, K), -1, dtype=torch.uint8)
+            for layer_idx, layer_chunks in chunks_by_layer.items():
+                if layer_chunks:
+                    full_layer_topk[layer_idx] = torch.cat(layer_chunks, dim=0)[:T, :]
+            result[rid] = {
+                "topk_ids_of_layer": full_layer_topk,
+                "positions": positions_by_rid[rid],
+                "shape": {"num_layers": max_layer, "num_tokens": T, "top_k": K},
+            }
+        return result
 
 
 def process_topk_ids(topk_ids: torch.Tensor, expert_num: int, ep_size: int,
@@ -1098,7 +1178,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 scoring_func=scoring_func,
                 e_score_correction_bias=e_score_correction_bias,
             )
-
+        recorder = RoutingRecorder()
+        attn_metadata = get_forward_context().attn_metadata
+        # print(f"lq debug, metedata is {attn_metadata.req_indices}")
+        if attn_metadata and hasattr(attn_metadata, "req_indices"):
+            layer_idx = extract_layer_index(kwargs.get("prefix", None))
+            # print(
+            #     f"lq debug, attn_metadata.positions in forward is {attn_metadata.positions}, record is {recorder.dump()}")
+            recorder.record(req_indices=attn_metadata.req_indices, positions=attn_metadata.positions,
+                            layer_idx=layer_idx,
+                            topk_ids=topk_ids)
+        # print(f"lq debug, topk_ids is {topk_ids}, record is {recorder.dump()}")
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
@@ -1165,7 +1255,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
 
 class AscendFusedMoE(FusedMoE):
-
     # The moe_counter parameter is required during the initialization of EPLB
     # to identify the current layer index within the MOE model.
     moe_counter = -1
@@ -1231,6 +1320,7 @@ class AscendFusedMoE(FusedMoE):
         self.activation = activation
         self.log2phy = None
         self.global_redundant_expert_num = 0
+        self.prefix = prefix
 
         is_deepseek_v3_r1 = self.global_num_experts == 256
         self.rm_router_logits = get_rm_router_logits_state(
@@ -1476,6 +1566,7 @@ class AscendFusedMoE(FusedMoE):
             token_dispatcher=self.token_dispatcher,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
+            prefix=self.prefix,
         )
 
         if shared_experts:
