@@ -29,6 +29,8 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map,
     get_compressed_expert_map)
 from vllm.model_executor.layers.shared_fused_moe import SharedFusedMoE
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
@@ -126,6 +128,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts)
+
+        layer_idx = extract_layer_index(kwargs.get("prefix", None))
+        capturer = RoutedExpertsCapturer.get_instance()
+        if capturer is not None:
+            capturer.capture(layer_id=layer_idx, topk_ids=topk_ids)
 
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
@@ -336,7 +343,8 @@ class AscendFusedMoE(FusedMoE):
             shared_experts=None,
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num)
+            global_redundant_expert_num=self.global_redundant_expert_num,
+            prefix=self.layer_name)
 
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states

@@ -99,6 +99,8 @@ from vllm.v1.worker.utils import (AttentionGroup, bind_kv_cache,
                                   gather_mm_placeholders,
                                   sanity_check_mm_encoder_outputs,
                                   scatter_mm_placeholders)
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer, RoutedExpertsReader
+from vllm.distributed import get_tensor_model_parallel_rank
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -1293,6 +1295,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                arange,
                out=positions_np)
 
+        # token_to_req_id = [self.input_batch.req_ids[idx] for idx in req_indices]
+        # print(
+        #     f"lq debug, req_indices is {req_indices}, token_to_req_id is {token_to_req_id}, positions_np is {positions_np}")
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1478,6 +1484,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     non_blocking=True,
                 )
                 self.slot_mapping[total_num_scheduled_tokens:].fill_(0)
+            self.slot_mapping_cpu[:total_num_scheduled_tokens].copy_(self.slot_mapping[:total_num_scheduled_tokens],
+                                                                     non_blocking=True)
 
             # Make AscendCommonAttentionMetadata
             common_attn_metadata = AscendCommonAttentionMetadata(
@@ -1898,6 +1906,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        RoutedExpertsCapturer.get_instance().clear_buffer()
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
@@ -2166,6 +2175,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         extra_args = ({"kv_connector_output": kv_connector_output})
 
+        if self.model_config.enable_return_routed_experts and get_tensor_model_parallel_rank() == 0:
+            np.set_printoptions(threshold=np.inf, linewidth=500)
+            # print(f"lq debug, slot_mapping_np is {self.slot_mapping_np[:scheduler_output.total_num_scheduled_tokens]}")
+            RoutedExpertsCapturer.get_instance().save_captured_experts(
+                indices=self.slot_mapping_np[:scheduler_output.total_num_scheduled_tokens])
+            # if RoutedExpertsReader.get_instance() is None:
+            #     routed_experts_reader = RoutedExpertsReader.create(
+            #         enable=self.vllm_config.model_config.enable_return_routed_experts
+            #     )
+            #     routed_experts_reader.attach_buffer(
+            #         max_num_kv_tokens=self.max_num_kv_tokens,
+            #         model_config=self.vllm_config.model_config,
+            #         instance_id=self.instance_id,
+            #     )
+            # routed_experts = RoutedExpertsReader.get_instance().get_routed_experts(
+            #     indices=self.slot_mapping_np[:scheduler_output.total_num_scheduled_tokens]
+            # )
+            # print(f"lq debug, vllm-ascend routed_experts is {routed_experts}")
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2723,6 +2750,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+        self.init_routed_experts_capturer()
+
+    def init_routed_experts_capturer(self):
+        logger.info(
+            "Initializing routed experts capturer, enable_return_routed_experts: %s",
+            self.model_config.enable_return_routed_experts,
+        )
+        routed_experts_capturer = RoutedExpertsCapturer.create(
+            self.model_config.enable_return_routed_experts
+        )
+        block_size = self.cache_config.block_size
+        self.max_num_kv_tokens = (
+                                         self.kv_cache_config.num_blocks // len(self.kv_cache_config.kv_cache_groups)
+                                         + 1
+                                 ) * block_size
+        self.instance_id = f"rank_{self.vllm_config.parallel_config.rank // self.vllm_config.parallel_config.world_size}"
+        routed_experts_capturer.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_kv_tokens=self.max_num_kv_tokens,
+            model_config=self.model_config,
+            instance_id=self.instance_id,
+            enable_shared_memory=get_tensor_model_parallel_rank() == 0,
+        )
 
     def _align_memory(self, tensor: torch.Tensor,
                       alignment: int) -> torch.Tensor:
