@@ -37,6 +37,8 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizationConfig
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -1099,6 +1101,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 e_score_correction_bias=e_score_correction_bias,
             )
 
+        layer_idx = extract_layer_index(kwargs.get("prefix", None))
+        capturer = RoutedExpertsCapturer.get_instance()
+        if capturer is not None:
+            capturer.capture(layer_id=layer_idx, topk_ids=topk_ids)
         topk_weights = topk_weights.to(x.dtype)
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
@@ -1231,6 +1237,7 @@ class AscendFusedMoE(FusedMoE):
         self.activation = activation
         self.log2phy = None
         self.global_redundant_expert_num = 0
+        self.prefix = prefix
 
         is_deepseek_v3_r1 = self.global_num_experts == 256
         self.rm_router_logits = get_rm_router_logits_state(
@@ -1476,6 +1483,7 @@ class AscendFusedMoE(FusedMoE):
             token_dispatcher=self.token_dispatcher,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
+            prefix=self.prefix,
         )
 
         if shared_experts:
